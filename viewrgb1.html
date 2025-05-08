@@ -1,0 +1,501 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>RGB Colored Image Cube Viewer</title>
+    <style>
+        body { margin: 0; overflow: hidden; font-family: sans-serif; background-color: #111; color: #eee; }
+        #container { width: 100vw; height: 100vh; display: block; }
+        #loader {
+            position: absolute;
+            top: 20px;
+            left: 20px;
+            background-color: rgba(0,0,0,0.7);
+            padding: 10px 15px;
+            border-radius: 5px;
+            color: white;
+            z-index: 10;
+        }
+        #loader label, #loader input { display: block; margin-bottom: 5px;}
+        #status { margin-top: 5px; font-style: italic; font-size: 0.9em;}
+        #tooltip {
+            position: absolute;
+            display: none;
+            padding: 8px;
+            background: rgba(20, 20, 20, 0.85);
+            border: 1px solid #666;
+            border-radius: 4px;
+            color: white;
+            pointer-events: none; /* So it doesn't interfere with mouse events */
+            z-index: 100;
+            text-align: center;
+            font-size: 0.8em;
+        }
+        #tooltip img {
+            max-width: 120px; /* Slightly larger thumbnail */
+            max-height: 120px;
+            display: block;
+            margin-bottom: 4px;
+        }
+        #modal {
+            position: fixed;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            background-color: rgba(0,0,0,0.9); /* Darker background */
+            display: none; /* Hidden by default */
+            justify-content: center;
+            align-items: center;
+            z-index: 1000;
+            cursor: pointer;
+        }
+        #modal img {
+            max-width: 90vw;
+            max-height: 90vh;
+            object-fit: contain;
+            border: 3px solid white;
+            border-radius: 3px;
+            cursor: default; /* Prevent inner cursor change */
+            box-shadow: 0 0 25px rgba(255, 255, 255, 0.3);
+        }
+        #modal-close {
+             position: absolute;
+             top: 15px;
+             right: 25px;
+             font-size: 35px;
+             font-weight: bold;
+             color: #ccc;
+             cursor: pointer;
+             line-height: 1;
+             text-shadow: 0 0 5px black;
+             transition: color 0.2s ease;
+        }
+        #modal-close:hover {
+            color: white;
+        }
+    </style>
+</head>
+<body>
+    <div id="container"></div>
+
+    <div id="loader">
+        <label for="dbInput">Select Image Database (.db):</label>
+        <input type="file" id="dbInput" accept=".db">
+        <div id="status">Waiting for database file...</div>
+    </div>
+
+    <div id="tooltip">
+        <img id="tooltip-img" src="" alt="thumbnail"/>
+        <span id="tooltip-name"></span>
+    </div>
+
+    <div id="modal">
+        <span id="modal-close" title="Close">×</span>
+        <img id="modal-img" src="" alt="Full Image"/>
+    </div>
+
+    <!-- Libraries: Three.js, OrbitControls, sql.js -->
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/three@0.128.0/examples/js/controls/OrbitControls.js"></script>
+    <script src='https://cdnjs.cloudflare.com/ajax/libs/sql.js/1.10.3/sql-wasm.js'></script>
+
+    <script>
+        // --- Global Variables ---
+        let scene, camera, renderer, controls, raycaster, mouse;
+        let pointsObject = null; // Holds the THREE.Points object
+        let imageData = []; // Stores { filename, blob, r, g, b, index }
+        let hoveredPointIndex = -1;
+        let tooltipElement, tooltipImg, tooltipName;
+        let modalElement, modalImg, modalClose;
+        let dbInput, statusElement;
+        let sql = null; // sql.js database instance
+
+        const CUBE_SCALE = 256; // Using 256 makes mapping easier visually
+        const POINT_SIZE = 2.5; // Size of points
+        const RAYCASTER_THRESHOLD = 4; // Sensitivity for point hovering
+
+        // --- Initialization ---
+        async function initSql() {
+             try {
+                updateStatus("Loading WASM SQL library...");
+                const SQL = await initSqlJs({ locateFile: file => `https://cdnjs.cloudflare.com/ajax/libs/sql.js/1.10.3/${file}` });
+                updateStatus("SQL library loaded. Ready for DB file.");
+                return SQL;
+            } catch (err) {
+                console.error("Failed to initialize sql.js:", err);
+                updateStatus("Error loading SQL library. Check console.");
+                return null;
+            }
+        }
+
+        function initThree() {
+            const container = document.getElementById('container');
+
+            // Scene
+            scene = new THREE.Scene();
+            scene.background = new THREE.Color(0x1a1a1a); // Dark grey background
+
+            // Camera
+            camera = new THREE.PerspectiveCamera(60, window.innerWidth / window.innerHeight, 0.1, CUBE_SCALE * 5); // Adjust FOV and far plane
+            camera.position.set(CUBE_SCALE * 0.7, CUBE_SCALE * 0.7, CUBE_SCALE * 1.4); // Position relative to cube size
+
+            // Renderer
+            renderer = new THREE.WebGLRenderer({ antialias: true });
+            renderer.setSize(window.innerWidth, window.innerHeight);
+            renderer.setPixelRatio(window.devicePixelRatio);
+            container.appendChild(renderer.domElement);
+
+            // Lights
+            const ambientLight = new THREE.AmbientLight(0xffffff, 0.7); // Brighter ambient
+            scene.add(ambientLight);
+            const directionalLight = new THREE.DirectionalLight(0xffffff, 0.6);
+            directionalLight.position.set(0.5, 1, 0.75); // Adjust light direction
+            scene.add(directionalLight);
+
+            // Controls
+            controls = new THREE.OrbitControls(camera, renderer.domElement);
+            controls.enableDamping = true;
+            controls.dampingFactor = 0.08; // Smoother damping
+            controls.screenSpacePanning = false;
+            // Center controls near the middle of the 0-255 mapped cube
+            controls.target.set(0, 0, 0);
+
+            // Raycaster for interaction
+            raycaster = new THREE.Raycaster();
+            raycaster.params.Points.threshold = RAYCASTER_THRESHOLD; // Sensitivity for points
+            mouse = new THREE.Vector2();
+
+            // UI Elements
+            tooltipElement = document.getElementById('tooltip');
+            tooltipImg = document.getElementById('tooltip-img');
+            tooltipName = document.getElementById('tooltip-name');
+            modalElement = document.getElementById('modal');
+            modalImg = document.getElementById('modal-img');
+            modalClose = document.getElementById('modal-close');
+            dbInput = document.getElementById('dbInput');
+            statusElement = document.getElementById('status');
+
+            // Axes Helper (RGB = XYZ)
+            const axesHelper = new THREE.AxesHelper(CUBE_SCALE * 0.55); // Relative size
+            scene.add(axesHelper);
+
+            // Wireframe Box (visual reference for the 0-255 cube boundaries)
+            const boxGeo = new THREE.BoxGeometry(CUBE_SCALE, CUBE_SCALE, CUBE_SCALE);
+            const boxEdges = new THREE.EdgesGeometry(boxGeo);
+            // Offset the box slightly so points aren't exactly on the edge visually
+            const boxLines = new THREE.LineSegments(boxEdges, new THREE.LineBasicMaterial({ color: 0x555555 }));
+            boxLines.position.set(0, 0, 0); // Center box at origin
+            scene.add(boxLines);
+
+
+            // Event Listeners
+            window.addEventListener('resize', onWindowResize);
+            renderer.domElement.addEventListener('mousemove', onMouseMove, false);
+            renderer.domElement.addEventListener('click', onClick, false);
+            modalElement.addEventListener('click', hideModal); // Click background to close
+            modalClose.addEventListener('click', (e) => {
+                e.stopPropagation(); // Prevent background click when clicking 'X'
+                hideModal();
+             });
+             modalImg.addEventListener('click', (e) => e.stopPropagation()); // Prevent modal close when clicking image itself
+
+            dbInput.addEventListener('change', handleFileSelect);
+
+            animate();
+        }
+
+        // --- Database Handling ---
+        async function handleFileSelect(event) {
+            const file = event.target.files[0];
+            if (!file) {
+                updateStatus("No file selected.");
+                return;
+            }
+             if (!sql) {
+                updateStatus("SQL library not ready. Please wait or refresh.");
+                return;
+            }
+
+            // Clear previous data visually
+            imageData = [];
+            createPointCloud(); // This will remove the old points object
+
+            updateStatus(`Reading file: ${file.name} (${(file.size / 1024 / 1024).toFixed(2)} MB)...`);
+
+            try {
+                const arrayBuffer = await file.arrayBuffer();
+                updateStatus("Opening database...");
+                // Use worker? For very large DBs, might consider sql.js worker, but adds complexity
+                const db = new sql.Database(new Uint8Array(arrayBuffer));
+                updateStatus("Querying images table...");
+
+                // IMPORTANT: Ensure column names match your DB schema exactly!
+                // Added id for potential future use, though not used currently
+                const results = db.exec("SELECT id, original_filename, webp_blob, avg_r, avg_g, avg_b FROM images");
+
+                if (results.length === 0 || !results[0].values || results[0].values.length === 0) {
+                    updateStatus("No image data found in table 'images'.");
+                    imageData = [];
+                } else {
+                    updateStatus(`Processing ${results[0].values.length} records...`);
+                    // Process results efficiently
+                    imageData = results[0].values.map((row, index) => ({
+                        // id: row[0], // Keep if needed later
+                        filename: row[1],
+                        blob: row[2], // This is the Uint8Array blob
+                        r: row[3],
+                        g: row[4],
+                        b: row[5],
+                        index: index // Original index in the queried results
+                    }));
+                    updateStatus(`Loaded ${imageData.length} images. Creating visualization...`);
+                }
+
+                db.close(); // Close the DB to free memory
+                createPointCloud(); // Update the visualization
+                updateStatus(`Visualizing ${imageData.length} images. DB closed.`);
+
+            } catch (err) {
+                console.error("Database Error:", err);
+                updateStatus(`Error processing database: ${err.message}. Check console.`);
+                imageData = [];
+                createPointCloud(); // Clear existing points if any
+            }
+        }
+
+
+        // --- Visualization (with Vertex Colors) ---
+        function createPointCloud() {
+            // Remove previous points object if it exists
+            if (pointsObject) {
+                if (pointsObject.geometry) pointsObject.geometry.dispose();
+                if (pointsObject.material) pointsObject.material.dispose();
+                scene.remove(pointsObject);
+                pointsObject = null;
+                console.log("Previous point cloud removed.");
+            }
+
+            if (imageData.length === 0) {
+                console.log("No image data to create points.");
+                renderer.render(scene, camera); // Render empty scene if data cleared
+                return; // Nothing to draw
+            }
+
+            console.log(`Creating point cloud for ${imageData.length} images...`);
+
+            const geometry = new THREE.BufferGeometry();
+            const positions = new Float32Array(imageData.length * 3);
+            const colors = new Float32Array(imageData.length * 3);
+            const dataIndices = new Uint32Array(imageData.length); // Use appropriate type
+
+            imageData.forEach((img, i) => {
+                 const baseIndex = i * 3;
+
+                // Map RGB (0-255) to XYZ (-SCALE/2 to +SCALE/2) - Centered Cube
+                positions[baseIndex]     = (img.r / 255.0 - 0.5) * CUBE_SCALE;
+                positions[baseIndex + 1] = (img.g / 255.0 - 0.5) * CUBE_SCALE;
+                positions[baseIndex + 2] = (img.b / 255.0 - 0.5) * CUBE_SCALE;
+
+                // Add normalized color for this point
+                colors[baseIndex]     = img.r / 255.0; // R (0.0 to 1.0)
+                colors[baseIndex + 1] = img.g / 255.0; // G (0.0 to 1.0)
+                colors[baseIndex + 2] = img.b / 255.0; // B (0.0 to 1.0)
+
+                dataIndices[i] = img.index; // Store the original index
+            });
+
+            geometry.setAttribute('position', new THREE.BufferAttribute(positions, 3));
+            geometry.setAttribute('color', new THREE.BufferAttribute(colors, 3));
+            geometry.setAttribute('dataIndex', new THREE.BufferAttribute(dataIndices, 1));
+
+            // Material for the points using vertex colors
+            const material = new THREE.PointsMaterial({
+                size: POINT_SIZE,
+                sizeAttenuation: true, // Points get smaller further away
+                vertexColors: true,    // Use colors from the geometry's 'color' attribute
+                transparent: true,     // Optional: May help if points overlap heavily
+                opacity: 0.9           // Optional: Adjust transparency
+            });
+
+            pointsObject = new THREE.Points(geometry, material);
+            scene.add(pointsObject);
+            console.log("Point cloud created with vertex colors.");
+            // Optional: Center camera view on the points after creation
+            // const box = new THREE.Box3().setFromObject(pointsObject);
+            // const center = box.getCenter(new THREE.Vector3());
+            // controls.target.copy(center);
+            // camera.lookAt(center);
+        }
+
+        // --- Interaction & UI ---
+        function updateStatus(message) {
+            if (statusElement) {
+                statusElement.textContent = message;
+                console.log("Status:", message); // Also log to console
+            }
+        }
+
+        function onWindowResize() {
+            camera.aspect = window.innerWidth / window.innerHeight;
+            camera.updateProjectionMatrix();
+            renderer.setSize(window.innerWidth, window.innerHeight);
+        }
+
+        function onMouseMove(event) {
+            // Prevent tooltip updates if modal is open
+             if (!pointsObject || modalElement.style.display === 'flex') {
+                 hideTooltip(); // Ensure tooltip is hidden if modal opens while hovering
+                 return;
+             }
+
+            mouse.x = (event.clientX / window.innerWidth) * 2 - 1;
+            mouse.y = -(event.clientY / window.innerHeight) * 2 + 1;
+
+            raycaster.setFromCamera(mouse, camera);
+            const intersects = raycaster.intersectObject(pointsObject);
+
+            if (intersects.length > 0) {
+                const intersect = intersects[0];
+                const pointIndex = intersect.index;
+
+                // Check if it's a *new* point being hovered
+                if (pointIndex !== hoveredPointIndex) {
+                    // Get the original data index from the custom attribute
+                    // Use geometry.attributes directly
+                    const dataIdx = pointsObject.geometry.attributes.dataIndex.getX(pointIndex);
+                    const imgData = imageData.find(d => d.index === dataIdx); // Find by original index
+
+                    if(imgData) {
+                        // Revoke previous URL to prevent memory leaks
+                        if (tooltipImg.dataset.currentUrl) {
+                             URL.revokeObjectURL(tooltipImg.dataset.currentUrl);
+                        }
+
+                        // Create Blob URL from Uint8Array
+                        try {
+                            const blob = new Blob([imgData.blob], { type: 'image/webp' });
+                            const imageUrl = URL.createObjectURL(blob);
+                            tooltipImg.src = imageUrl;
+                            tooltipImg.dataset.currentUrl = imageUrl; // Store for revocation
+                            tooltipName.innerHTML = `${imgData.filename}<br>RGB: (${imgData.r}, ${imgData.g}, ${imgData.b})`; // Use innerHTML for line break
+
+                            tooltipElement.style.display = 'block'; // Show before positioning
+                            hoveredPointIndex = pointIndex; // Update hovered index *after* successful update
+                        } catch (blobError) {
+                            console.error("Error creating blob URL:", blobError);
+                            hideTooltip();
+                        }
+                    } else {
+                         console.warn("Could not find image data for point index:", pointIndex, "mapped data index:", dataIdx);
+                         hideTooltip();
+                    }
+                }
+                 // Update position even if it's the same point, as long as tooltip is visible
+                if(tooltipElement.style.display === 'block'){
+                    // Keep tooltip offset from cursor
+                    const offsetX = 15;
+                    const offsetY = 15;
+                    let newX = event.clientX + offsetX;
+                    let newY = event.clientY + offsetY;
+
+                    // Prevent tooltip going off-screen
+                    const tooltipRect = tooltipElement.getBoundingClientRect();
+                    if (newX + tooltipRect.width > window.innerWidth) {
+                        newX = event.clientX - tooltipRect.width - offsetX;
+                    }
+                     if (newY + tooltipRect.height > window.innerHeight) {
+                        newY = event.clientY - tooltipRect.height - offsetY;
+                    }
+
+                    tooltipElement.style.left = `${newX}px`;
+                    tooltipElement.style.top = `${newY}px`;
+                }
+
+            } else {
+                hideTooltip();
+            }
+        }
+
+        function hideTooltip() {
+             if (hoveredPointIndex !== -1 || tooltipElement.style.display === 'block') {
+                if (tooltipImg.dataset.currentUrl) {
+                    URL.revokeObjectURL(tooltipImg.dataset.currentUrl); // Clean up Blob URL
+                    tooltipImg.dataset.currentUrl = '';
+                    tooltipImg.src = ''; // Clear image src
+                }
+                tooltipElement.style.display = 'none';
+                hoveredPointIndex = -1;
+            }
+        }
+
+        function onClick(event) {
+             // Only trigger click if hovering over a valid point and modal is not already open
+            if (!pointsObject || hoveredPointIndex === -1 || modalElement.style.display === 'flex') return;
+
+            // Use the currently hovered point's data
+             const dataIdx = pointsObject.geometry.attributes.dataIndex.getX(hoveredPointIndex);
+             const imgData = imageData.find(d => d.index === dataIdx); // Find by original index
+
+            if(imgData) {
+                 // Revoke previous modal URL if any
+                 if (modalImg.dataset.currentUrl) {
+                    URL.revokeObjectURL(modalImg.dataset.currentUrl);
+                 }
+
+                 try {
+                     const blob = new Blob([imgData.blob], { type: 'image/webp' });
+                     const imageUrl = URL.createObjectURL(blob);
+                     modalImg.src = imageUrl;
+                     modalImg.dataset.currentUrl = imageUrl; // Store for revocation
+                     modalElement.style.display = 'flex'; // Use flex to center content
+                     hideTooltip(); // Hide tooltip when modal opens
+                 } catch (blobError) {
+                     console.error("Error creating blob URL for modal:", blobError);
+                     updateStatus("Error displaying full image.");
+                 }
+
+            } else {
+                console.warn("Clicked point, but could not find image data for index:", hoveredPointIndex, "mapped data index:", dataIdx);
+            }
+        }
+
+         function hideModal() {
+             if (modalImg.dataset.currentUrl) {
+                 URL.revokeObjectURL(modalImg.dataset.currentUrl); // Clean up Blob URL
+                 modalImg.dataset.currentUrl = '';
+                 modalImg.src = ''; // Clear src
+             }
+             modalElement.style.display = 'none';
+        }
+
+        // --- Animation Loop ---
+        function animate() {
+            requestAnimationFrame(animate);
+            controls.update(); // Required for damping
+            renderer.render(scene, camera);
+        }
+
+        // --- Start ---
+        // Make sure DOM is ready before accessing elements like dbInput
+        document.addEventListener('DOMContentLoaded', () => {
+            // Initialize Three.js elements first so the canvas exists
+            initThree();
+            // Then try loading sql.js
+             initSql().then(SQL => {
+               if (SQL) {
+                   sql = SQL; // Store the initialized SQL instance
+               } else {
+                   updateStatus("SQL library failed to load. Viewer may not function.");
+               }
+            }).catch(err => {
+                console.error("Error during SQL initialization promise:", err);
+                updateStatus("Error setting up SQL. Check console.");
+            });
+        });
+
+
+    </script>
+</body>
+</html>
