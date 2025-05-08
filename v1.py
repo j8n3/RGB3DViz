@@ -6,8 +6,8 @@ from pathlib import Path
 import os # Still needed for cpu_count for webp saving efficiency
 
 # --- Configuration ---
-SOURCE_FOLDER = Path("/home/dome/Pictures/Screenshots/")  # CHANGE to your image folder path
-DATABASE_FILE = Path("./image_ss_database.db")
+SOURCE_FOLDER = Path("/home/home/dir/")  # CHANGE to your image folder path
+DATABASE_FILE = Path("./imags0.db")
 TARGET_RESOLUTION = (1290, 720)
 IMAGE_FORMAT = "WEBP"
 # List common image extensions Pillow can usually handle
